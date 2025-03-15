@@ -1,0 +1,589 @@
+---
+title: "logisticsDataanalysis"
+author: "Kanishk Kapoor"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document provides an analysis for a real dataset related to logistics delays and their causes using R.
+
+### 1.Loading Required Packages
+```{r}
+# Load required package
+library(zoo)
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(tseries)
+library(forecast)
+library(Metrics)
+library(xgboost)
+```
+### 2. Loading Dataset
+```{r}
+data <- read.csv("smart_logistics_dataset.csv", stringsAsFactors = FALSE)
+head(data)
+```
+###3. Data Cleaning
+```{r}
+str(data)
+
+summary(data)
+
+colSums(is.na(data))
+```
+#### No missing values exist
+```{r}
+sapply(data,class)
+```
+#### Conversion to Factors
+Attributes such as Asset_ID and timestamp will excluded from conversion to factors
+```{r}
+# columns to exclude
+exclude_cols <- c("Asset_ID", "Timestamp")
+
+#converting rest of the columns as factors
+data[, !names(data) %in% exclude_cols] <- lapply(data[, !names(data) %in% exclude_cols], as.factor)
+```
+```{r}
+sapply(data,class)
+```
+#### Time to POSIXct format using lubridate
+```{r}
+data$Timestamp <- ymd_hms(data$Timestamp)
+data$Timestamp<- as.POSIXct(data$Timestamp,format="%Y-%m-%d %H:%M:%S")
+
+```
+
+### 4.EDA(Exploratory Data Analysis)
+
+#### A.Count Delayed vs non delayed shipments per Truck
+
+```{r}
+delay_counts <- data %>%
+  group_by(Asset_ID, Logistics_Delay) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  
+  # Convert to wide format so each truck appears only once
+  pivot_wider(names_from = Logistics_Delay, values_from = Count, values_fill = list(Count = 0)) %>%
+  
+  # Rename columns for clarity
+  rename(OnTime_Shipments = `0`, Delayed_Shipments = `1`)
+
+head(delay_counts)
+```
+```{r}
+#Convert from wide to long format for ggplot
+
+long_delay_counts <- delay_counts %>%
+  pivot_longer(cols = c(OnTime_Shipments, Delayed_Shipments),
+               names_to = "Logistics_Delay",
+               values_to = "Count")
+#Covert delay labels to 0 and 1 
+long_delay_counts$Logistics_Delay <- ifelse(long_delay_counts$Logistics_Delay == "OnTime_Shipments", "0", "1")
+```
+
+```{r}
+ggplot(long_delay_counts, aes(x= Asset_ID , y = Count, fill= as.factor(Logistics_Delay))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title=" Proportions of Delays Per Truck",
+       x = "Truck ID",
+       y = "Proportions of Shipments",
+       fill = "Logistics Delay(0=NO , 1= YES)") +
+    coord_flip()
+```
+
+```{r}
+#Calculate delay rate per truck
+delay_rate<- data%>%
+  mutate(Logistics_Delay = as.numeric(as.character(Logistics_Delay))) %>%
+  group_by(Asset_ID) %>%
+  summarise(Total_Shipments= n(),
+            Delayed_Shipments= sum(Logistics_Delay),
+            Delay_Rate = Delayed_Shipments/ Total_Shipments) %>%
+  arrange(desc(Delay_Rate)) %>%
+  head(5)
+
+print(delay_rate)
+```
+#### MOST DELAYED SHIPMENTS BY TRUCK 10 AND TRUCK 3
+
+#### B. Logistics Delay Reasons
+```{r}
+delay_reasons<- data %>%
+  group_by(Logistics_Delay_Reason) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(delay_reasons)
+```
+```{r}
+weather_delay <- data %>%
+  mutate(
+    Temperature = as.numeric(as.character(Temperature)),
+    Humidity = as.numeric(as.character(Humidity))
+  ) %>%
+  filter(Logistics_Delay_Reason == "Weather") %>%
+  summarise(
+    Average_Temperature= mean(Temperature, na.rm= TRUE),
+    Average_Humidity = mean(Humidity, na.rm = TRUE)
+  )
+
+print(weather_delay)
+```
+```{r}
+ggplot(data, aes(x= Temperature, y=Humidity, color = Logistics_Delay_Reason)) +
+  geom_point(alpha=0.5)+
+  labs(title="TEMP & HUMIDITY impact on delays",
+       x="Temperature",
+       y="Humidity")
+
+```
+
+```{r}
+ggplot(data, aes(x=Temperature,y=Humidity, color = Logistics_Delay_Reason == "Weather" )) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Temperature vs Humidity for Weather-related delays",
+       x="Temperature",
+       y="Humidity") +
+  theme_minimal()
+```
+```{r}
+geoData<- data %>%
+  filter(Logistics_Delay_Reason != "None") %>%
+  mutate(
+    Latitude = as.numeric(as.character(Latitude)),
+    Longitude = as.numeric(as.character(Longitude))
+  )
+ggplot(geoData, aes(x = Latitude, y = Longitude)) +
+  geom_point(aes(color = Logistics_Delay_Reason), alpha = 0.5) +
+  geom_density_2d(aes(color = Logistics_Delay_Reason), linewidth = 0.8, bins=6) +  # Use linewidth instead of size
+  labs(title = "Geographical Distribution of Delays",
+       x = "Latitude",
+       y = "Longitude",
+       color = "Delay Reason") +
+  theme_minimal()
+```
+```{r}
+ggplot(geoData,aes(x= Latitude, y= Longitude)) +
+  geom_bin2d(bins = 50) +
+  scale_fill_viridis_c(option = "plasma") +
+  geom_point(aes(color = Logistics_Delay_Reason), alpha = 0.5, size =1) +
+  labs(title = "Heatmap of logistics delays by location",
+       x="Latitude",
+       y="Longitude",
+       fill="Delay Density",
+       color="Delay Reason") +
+  theme_minimal()
+```
+
+```{r}
+traffic_weather <- data %>%
+  filter(Logistics_Delay_Reason =="Weather") %>%
+  group_by(Traffic_Status) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(traffic_weather)
+```
+
+#### C. Seasonal delay patterns
+```{r}
+# Extract numeric month (1 to 12)
+data$Month <- month(data$Timestamp)
+
+# Convert numeric month to abbreviated names
+data$Month <- factor(month.abb[data$Month], levels = month.abb)
+```
+
+```{r}
+monthly_delays <- data %>%
+  group_by(Month) %>%
+  summarise(Total_Shipments = n(),
+            Delayed_Shipments = sum(Logistics_Delay == 1),
+            Delay_Rate = Delayed_Shipments / Total_Shipments) %>%
+  arrange(match(Month, month.abb))
+
+print(monthly_delays)
+
+```
+```{r}
+ggplot(monthly_delays, aes(x= Month, y = Delayed_Shipments, fill = Month))+
+  geom_bar(stat = "identity") +
+  labs(title = "Total Delayed Shipments per Month",
+       x="Month",
+       y="Number of Delayed Shipments") +
+  theme_minimal()
+```
+##### Delays which were registered because of weather.
+```{r}
+monthly_weather_delays <- data %>%
+  filter(Logistics_Delay_Reason =="Weather") %>%
+  group_by(Month) %>%
+  summarise(Total_Shipments = n(),
+            Delayed_Shipments = sum(Logistics_Delay == 1),
+            Delay_Rate = Delayed_Shipments / Total_Shipments) %>%
+  arrange(match(Month, month.abb))
+
+print(monthly_weather_delays)
+```
+
+```{r}
+ggplot(monthly_weather_delays, aes(x= Month, y = Delayed_Shipments, fill = Month))+
+  geom_bar(stat = "identity") +
+  labs(title = "Total Weather-Delayed Shipments per Month",
+       x="Month",
+       y="Number of Delayed Shipments") +
+  theme_minimal()
+```
+
+#### D. Customer Purchase Frequency's correlation with high shipment delays trucks
+
+```{r}
+data$User_Purchase_Frequency <- as.numeric(as.character(data$User_Purchase_Frequency))
+data$User_Transaction_Amount <- as.numeric(as.character(data$User_Transaction_Amount))
+
+```
+
+```{r}
+delayed_trucks <- data %>%
+  filter(Asset_ID %in% c("Truck_10","Truck_3")) %>%
+  group_by(Month, Asset_ID) %>%
+  summarise(
+    Avg_Purchase_Frequency = mean(User_Purchase_Frequency, na.rm = TRUE),
+    Avg_Transaction_Amount = mean(User_Transaction_Amount, na.rm= TRUE)
+  ) %>%
+  arrange(Month)
+
+print(delayed_trucks)
+    
+  
+```
+
+##### PURCHASE FREQUENCY OF HIGH DELAY TRUCKS OVER TIME
+```{r}
+ggplot(delayed_trucks,aes(x=Month, y= Avg_Purchase_Frequency,group = Asset_ID,colour = Asset_ID))+
+  geom_line(size=1) +
+  geom_point(size=2) +
+  labs(title="Impact of Delayed Trucks on user purchase frequency",
+       x="Month",
+       y="Average Purchase Frequency",
+       color="Truck ID") +
+  theme_minimal()
+      
+```
+```{r}
+ggplot(delayed_trucks,aes(x=Month,y=Avg_Transaction_Amount,group = Asset_ID,color=Asset_ID)) +
+  geom_line(size=1) +
+  geom_point(size=1) +
+  labs(title = "Average Transaction Amount over the year for high delay trucks",
+       x= "MONTH",
+       y="Average Transaction Amount",
+       color="Truck ID") +
+  theme_minimal()
+  
+```
+
+###### AVERAGE USER PUCRHASE FREQUENCY ACROSS THE YEAR FOR ALL THE TRUCKS
+```{r}
+All_Trucks_Pf <- data %>%
+  group_by(Month, Asset_ID) %>%
+  summarise(
+    Avg_User_Pf = mean(User_Purchase_Frequency, na.rm = TRUE),
+    Avg_User_Transaction = mean(User_Transaction_Amount, na.rm= TRUE)
+  )
+
+print(All_Trucks_Pf)
+```
+```{r}
+ggplot(All_Trucks_Pf,aes(x=Month,y=Avg_User_Pf, group=Asset_ID,color=Asset_ID)) +
+  geom_line(size =1) +
+  geom_point(size =1) +
+  labs(title = "Impact of All trucks on User Purchase ",
+       x= "Month",
+       y= "Average Purchase Frequency",
+       color ="Truck ID") +
+  theme_minimal()
+```
+```{r}
+ggplot(All_Trucks_Pf,aes(x=Month,y=Avg_User_Transaction,group = Asset_ID,color = Asset_ID)) +
+  geom_line(size =0.7)+
+  geom_point(size=1)+
+  labs(title = "Average user transactions over the year of All Trucks",
+       x="Month",
+       y="Mean Transaction Amount",
+       color="Truck ID") +
+  theme_minimal()
+```
+#### E. Asset Utlization Analysis
+```{r}
+data$Asset_Utilization <-as.numeric(as.character(data$Asset_Utilization))
+```
+
+```{r}
+asset_util <- data %>%
+  group_by(Asset_ID) %>%
+  summarise(
+    Mean_Asset_Util = mean(Asset_Utilization,na.rm= TRUE),
+    Total_Orders = n()
+  ) %>%
+  arrange(desc(Mean_Asset_Util))
+
+print(asset_util)
+  
+```
+```{r}
+ggplot(asset_util,aes(x= reorder(Asset_ID,Mean_Asset_Util), y= Mean_Asset_Util, fill = Mean_Asset_Util)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Mean Asset Utilization per Truck",
+       x = "Truck ID",
+       y = "Mean Utilization (%)",
+       fill = "Utilization %") +
+  theme_minimal()
+```
+```{r}
+truck_performance <- delay_rate %>%
+  left_join(asset_util, by = "Asset_ID")
+
+print(truck_performance)
+```
+```{r}
+ggplot(truck_performance, aes(x=Mean_Asset_Util, y= Delay_Rate, label= Asset_ID))+
+  geom_point(size=3, color="red") +
+  geom_text(vjust = -1, size=3.5) +
+  labs(title="Asset Utilization vs Delay Rate",
+       x="Mean Asset Utilization (%)",
+       y="Delay Rate (%)") +
+  theme_minimal()
+  
+```
+### 5. Insights & Predictive Modelling
+✅ July had the highest shipment delays.(Especially Truck 10 and Truck 3)
+✅ User purchase frequency dropped significantly in August & September.
+✅ Potential cause-effect relationship: Customers may have lost trust due to delays in July, leading to lower purchase frequencies in the following months.
+✅ On the contrary, even though user purchase frequency dropped significantly but 
+   the user purchase transaction grew distinctively. 
+   POSSIBLE EXPLANATIONS FOR ANOMALY:
+1️⃣ Fewer Users, But Bigger Spenders 💰
+	•	Regular customers may have stopped purchasing due to delays.
+	•	However, a few high-value customers (B2B buyers, bulk orders) may have continued purchasing, increasing total transaction value.
+
+2️⃣ Stockpiling After Delays 📦
+	•	Customers affected by July delays might have compensated by making larger purchases later.
+	•	Companies ordering in bulk may have increased spending to avoid future stockouts.
+
+3️⃣ Price Hikes Due to Weather Delays 🌦️
+	•	Supply chain disruptions could have led to price increases, artificially inflating transaction values.
+	•	Businesses might have ordered fewer items but at higher prices.
+
+4️⃣ Shift in Customer Demographics 👥
+	•	Maybe casual buyers left, but loyal buyers stayed.
+	•	Are high-value customers the ones who continued purchasing
+	
+	
+#### Forecasting overall purchase transaction trends associated with logistics efficiency
+```{r}
+monthly_data <- data %>%
+  group_by(Month) %>%
+  summarise(Avg_Transaction_Amount = mean(User_Transaction_Amount, na.rm=TRUE))
+print(monthly_data)
+```
+```{r}
+library(forecast)
+
+ts_data <- ts(monthly_data$Avg_Transaction_Amount, start = c(2024,1), frequency = 12)
+
+plot(ts_data, main="Monthly avg user transactions", ylab="Avg Transaction Amount", xlab="Month")
+```
+```{r}
+fdata <- data %>%
+  mutate(Date = as.Date(Timestamp),
+         Month = format(Date, "%Y-%m"),
+         Week = format(Date, "%Y-%U"))
+print(fdata)
+```
+Since transaction behavior may depend on external factors, we should use:
+	•	Shipment & Logistics Delays: Logistics_Delay, Waiting_Time, Logistics_Delay_Reason
+	•	Environmental Factors: Temperature, Humidity, Traffic_Status
+	•	Asset Performance: Asset_Utilization, Inventory_Level
+	•	Customer Behavior: User_Purchase_Frequency
+```{r}
+regressor_vars <- c("Logistics_Delay", "Waiting_Time", "Temperature", "Humidity", "Traffic_Status","User_Purchase_Frequency","Asset_Utilization","Inventory_Level")
+print(regressor_vars)
+```
+```{r}
+library(dplyr)
+library(lubridate)
+
+
+monthly_data <- monthly_data %>%
+  mutate(Month = as.Date(paste0("2024-", Month, "-01"), format="%Y-%b-%d"))
+
+# Verify conversion
+str(monthly_data$Month)
+```
+
+
+Use Time Series Regression with External Regressors
+
+
+
+```{r}
+
+# Convert timestamp and extract Year-Week
+data <- data %>%
+  mutate(Date = as.Date(Timestamp),  
+         Week = format(Date, "%Y-%W"))  # Use "%W" for Monday-based weeks
+
+# Ensure Week is treated as a proper date (assigning the start of the week)
+data <- data %>%
+  mutate(Week = as.Date(cut(Date, breaks = "week", start.on.monday = TRUE)))
+
+# Aggregate data weekly
+weekly_data <- data %>%
+  group_by(Week) %>%
+  summarise(
+    User_Transaction_Amount = mean(User_Transaction_Amount, na.rm = TRUE),
+    Logistics_Delay = mean(Logistics_Delay, na.rm = TRUE),
+    Waiting_Time = mean(Waiting_Time, na.rm = TRUE),
+    Temperature = mean(Temperature, na.rm = TRUE),
+    Humidity = mean(Humidity, na.rm = TRUE),
+    User_Purchase_Frequency = mean(User_Purchase_Frequency, na.rm = TRUE),
+    Asset_Utilization = mean(Asset_Utilization, na.rm = TRUE),
+    Inventory_Level = mean(Inventory_Level, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Check results
+head(weekly_data)
+```
+
+```{r}
+x_data <- fread("smart_logistics_dataset.csv")
+head(x_data)
+```
+  •	lag_1: Last week’s transaction amount
+	•	lag_2: The amount from two weeks ago
+	•	lag_3: The amount from three weeks ago
+
+	•	The model uses these past values to predict future transactions.
+```{r}
+# Create Lag Features (Using past values to predict future)
+x_data[, lag_1 := shift(User_Transaction_Amount, 1)]
+x_data[, lag_2 := shift(User_Transaction_Amount, 2)]
+x_data[, lag_3 := shift(User_Transaction_Amount, 3)]
+
+```
+
+```{r}
+#Rolling statistics
+
+
+# Compute rolling mean and standard deviation
+x_data[, roll_mean_3 := rollapply(User_Transaction_Amount, width = 3, FUN = mean, align = "right", fill = NA)]
+x_data[, roll_std_3 := rollapply(User_Transaction_Amount, width = 3, FUN = sd, align = "right", fill = NA)]
+```
+
+```{r}
+x_data <- na.omit(x_data)
+```
+
+```{r}
+#Train and Test
+train_size <- floor(0.8 * nrow(x_data))
+train <- x_data[1:train_size, ]
+test <- x_data[(train_size+1): nrow(x_data), ]
+```
+
+```{r}
+
+# Convert to Matrix for XGBoost
+feature_cols <- c("lag_1", "lag_2", "lag_3", "roll_mean_3", "roll_std_3", 
+                  "Logistics_Delay", "Waiting_Time", "Temperature", 
+                  "Humidity", "User_Purchase_Frequency", 
+                  "Asset_Utilization", "Inventory_Level")
+
+train_matrix <- as.matrix(train[, feature_cols, with = FALSE])
+test_matrix <- as.matrix(test[, feature_cols, with = FALSE])
+
+train_labels <- train$User_Transaction_Amount
+test_labels <- test$User_Transaction_Amount
+
+# Train XGBoost Model
+xgb_model <- xgboost(data = train_matrix, 
+                     label = train_labels, 
+                     nrounds = 100, 
+                     objective = "reg:squarederror")
+
+# Predict Future Values
+predictions <- predict(xgb_model, test_matrix)
+
+# Evaluate Performance
+library(Metrics)
+rmse_val <- rmse(test_labels, predictions)
+mape_val <- mape(test_labels, predictions) * 100
+
+print(paste("RMSE:", rmse_val))
+print(paste("MAPE:", mape_val))
+```
+
+```{r}
+future_weeks <- 16 
+
+# Define last available date
+last_week_date <- as.Date(max(weekly_data$Week))
+
+# Generate future week dates
+forecast_weeks <- seq(last_week_date + 7, by = "week", length.out = future_weeks)
+
+# Prepare Future Regressors
+future_regressors <- tail(x_data, future_weeks)
+future_regressors <- as.matrix(future_regressors[, feature_cols, with = FALSE])
+
+# Generate Forecasts
+future_predictions <- predict(xgb_model, newdata = future_regressors)
+
+# Create Forecast DataFrame
+forecast_df <- data.frame(
+  Week = forecast_weeks,
+  Forecasted_Amount = future_predictions
+)
+
+# Convert 'Week' columns to Date format
+forecast_df$Week <- as.Date(forecast_df$Week)
+
+# Plot Forecasts
+ggplot() +
+  geom_line(data = weekly_data, aes(x = Week, y = User_Transaction_Amount), color = "blue") +  # Actual data
+  geom_line(data = forecast_df, aes(x = Week, y = Forecasted_Amount), color = "red", linetype = "dashed") +  # Forecast
+  labs(title = "XGBoost Forecast for User Transaction Amount",
+       x = "Week", y = "Transaction Amount") +
+  theme_minimal()
+```
+### Conclusion
+
+
+The analysis of logistics data has revealed key trends and patterns affecting delivery performance and user transaction behavior. The most significant findings include:
+	1.	Truck Performance: Trucks 10 and 3 experienced the highest number of delays, indicating potential inefficiencies or operational bottlenecks.
+	2.	Seasonal Delays: Delays peaked in July, particularly due to weather-related disruptions, highlighting the impact of seasonal variations on logistics performance.
+	3.	User Behavior Shift: Despite a sharp decline in user purchase frequency between August and September, the overall user transaction amount remained stable, suggesting that fewer but higher-value transactions were occurring.
+	4.	Asset Utilization: Truck 5 had the lowest asset utilization at 76%, which may indicate under use or inefficiency in fleet management.
+	5.	Overall Growth: A general increasing trend in logistics operations was observed from January to December, suggesting business expansion or improved operational efficiency.
+	6.	Geographical Impact: The least amount of delays was observed in specific latitude-longitude ranges (0,100) to (50,100), potentially due to optimized routes or favorable geographical conditions.
+	7.	Forecasting Insights: The predicted user transaction amount aligns well with the overall increasing trend and external factors, confirming the model’s reliability in capturing real-world logistics patterns.
+
+These insights can be leveraged to optimize fleet performance, anticipate seasonal impacts, improve asset utilization, and refine forecasting models for better decision-making in logistics operations.
